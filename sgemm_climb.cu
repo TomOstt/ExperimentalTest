@@ -7,6 +7,9 @@
 //             reuses it TS times. ~cache blocking, GPU edition.
 //   register: each thread computes an 8x8 microtile, keeping operands in
 //             REGISTERS (fastest memory there is). this is where it flies.
+//   reg_vec : + float4 vectorized loads (4 floats per instruction).
+//   reg_db  : + double buffering (prefetch next tile while computing current),
+//             so the load units and CUDA cores work at the same time.
 //   cublas  : NVIDIA's hand-tuned SGEMM = the real ceiling.
 
 #include <stdio.h>
@@ -73,6 +76,72 @@ __global__ void reg(const float*A,const float*B,float*C){
         C[(tRow*TM+i)*N+tCol*TN+j]=acc[i*TN+j];
 }
 
+// ---------- rung 4: + float4 vectorized loads (As stored transposed) ----------
+__global__ void reg_vec(const float*A,const float*B,float*C){
+    const int cRow=blockIdx.y, cCol=blockIdx.x;
+    const int tCol=threadIdx.x%(BN/TN), tRow=threadIdx.x/(BN/TN);
+    __shared__ float As[BK*BM], Bs[BK*BN];          // As transposed: [k][row]
+    A+=cRow*BM*N; B+=cCol*BN; C+=cRow*BM*N+cCol*BN;
+    const int iRowA=threadIdx.x/(BK/4), iColA=threadIdx.x%(BK/4);
+    const int iRowB=threadIdx.x/(BN/4), iColB=threadIdx.x%(BN/4);
+    float acc[TM*TN]={0.0f}, rM[TM], rN[TN];
+    for(int bk=0;bk<N;bk+=BK){
+        float4 a=*reinterpret_cast<const float4*>(&A[iRowA*N+iColA*4]);
+        As[(iColA*4+0)*BM+iRowA]=a.x; As[(iColA*4+1)*BM+iRowA]=a.y;
+        As[(iColA*4+2)*BM+iRowA]=a.z; As[(iColA*4+3)*BM+iRowA]=a.w;
+        *reinterpret_cast<float4*>(&Bs[iRowB*BN+iColB*4])=
+            *reinterpret_cast<const float4*>(&B[iRowB*N+iColB*4]);
+        __syncthreads();
+        A+=BK; B+=BK*N;
+        for(int d=0;d<BK;d++){
+            for(int i=0;i<TM;i++) rM[i]=As[d*BM+tRow*TM+i];
+            for(int j=0;j<TN;j++) rN[j]=Bs[d*BN+tCol*TN+j];
+            for(int i=0;i<TM;i++) for(int j=0;j<TN;j++) acc[i*TN+j]+=rM[i]*rN[j];
+        }
+        __syncthreads();
+    }
+    for(int i=0;i<TM;i++) for(int j=0;j<TN;j+=4)
+        *reinterpret_cast<float4*>(&C[(tRow*TM+i)*N+tCol*TN+j])=
+            *reinterpret_cast<float4*>(&acc[i*TN+j]);
+}
+
+// ---------- rung 5: + double buffering (prefetch next tile while computing) ----------
+__global__ void reg_db(const float*A,const float*B,float*C){
+    const int cRow=blockIdx.y, cCol=blockIdx.x;
+    const int tCol=threadIdx.x%(BN/TN), tRow=threadIdx.x/(BN/TN);
+    __shared__ float As[2][BK*BM], Bs[2][BK*BN];    // TWO shelves, ping-pong
+    A+=cRow*BM*N; B+=cCol*BN; C+=cRow*BM*N+cCol*BN;
+    const int iRowA=threadIdx.x/(BK/4), iColA=threadIdx.x%(BK/4);
+    const int iRowB=threadIdx.x/(BN/4), iColB=threadIdx.x%(BN/4);
+    float acc[TM*TN]={0.0f}, rM[TM], rN[TN];
+
+    #define LOAD(buf) {                                                        \
+        float4 a=*reinterpret_cast<const float4*>(&A[iRowA*N+iColA*4]);        \
+        As[buf][(iColA*4+0)*BM+iRowA]=a.x; As[buf][(iColA*4+1)*BM+iRowA]=a.y;  \
+        As[buf][(iColA*4+2)*BM+iRowA]=a.z; As[buf][(iColA*4+3)*BM+iRowA]=a.w;  \
+        *reinterpret_cast<float4*>(&Bs[buf][iRowB*BN+iColB*4])=               \
+            *reinterpret_cast<const float4*>(&B[iRowB*N+iColB*4]); }
+    #define COMPUTE(buf) for(int d=0;d<BK;d++){                               \
+        for(int i=0;i<TM;i++) rM[i]=As[buf][d*BM+tRow*TM+i];                  \
+        for(int j=0;j<TN;j++) rN[j]=Bs[buf][d*BN+tCol*TN+j];                  \
+        for(int i=0;i<TM;i++) for(int j=0;j<TN;j++) acc[i*TN+j]+=rM[i]*rN[j]; }
+
+    LOAD(0); A+=BK; B+=BK*N; __syncthreads();        // prologue: fill shelf 0
+    int buf=0;
+    for(int bk=BK;bk<N;bk+=BK){
+        LOAD(buf^1); A+=BK; B+=BK*N;                  // prefetch next -> other shelf
+        COMPUTE(buf);                                 // compute current, in parallel
+        __syncthreads();
+        buf^=1;
+    }
+    COMPUTE(buf);                                     // epilogue: last shelf
+    #undef LOAD
+    #undef COMPUTE
+    for(int i=0;i<TM;i++) for(int j=0;j<TN;j+=4)
+        *reinterpret_cast<float4*>(&C[(tRow*TM+i)*N+tCol*TN+j])=
+            *reinterpret_cast<float4*>(&acc[i*TN+j]);
+}
+
 static float* devrand(size_t n){
     float*h=(float*)malloc(n*4); for(size_t i=0;i<n;i++) h[i]=(i%13)*0.1f;
     float*d; cudaMalloc(&d,n*4); cudaMemcpy(d,h,n*4,cudaMemcpyHostToDevice);
@@ -95,6 +164,8 @@ static float *dA,*dB,*dC; static cublasHandle_t H;
 static void r_naive(void){ dim3 b(16,16),g((N+15)/16,(N+15)/16); naive<<<g,b>>>(dA,dB,dC);}
 static void r_shared(void){ dim3 b(TS,TS),g(N/TS,N/TS); shared<<<g,b>>>(dA,dB,dC);}
 static void r_reg(void){ dim3 g(N/BN,N/BM); reg<<<g,(BM*BN)/(TM*TN)>>>(dA,dB,dC);}
+static void r_vec(void){ dim3 g(N/BN,N/BM); reg_vec<<<g,(BM*BN)/(TM*TN)>>>(dA,dB,dC);}
+static void r_db(void){ dim3 g(N/BN,N/BM); reg_db<<<g,(BM*BN)/(TM*TN)>>>(dA,dB,dC);}
 static void r_cublas(void){ float al=1,be=0;
     // row-major C=A*B  ==  column-major C = B*A with args swapped
     cublasSgemm(H,CUBLAS_OP_N,CUBLAS_OP_N,N,N,N,&al,dB,N,dA,N,&be,dC,N);}
@@ -107,6 +178,8 @@ int main(void){
     bench("naive",  r_naive);
     bench("shared", r_shared);
     bench("register",r_reg);
+    bench("reg_vec",r_vec);
+    bench("reg_db", r_db);
     bench("cublas", r_cublas);
     return 0;
 }
