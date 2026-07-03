@@ -26,4 +26,4 @@ next real jump; double buffering added a sliver on top (the warp scheduler alrea
 hides most of that latency for free). we land at ~62% of cublas.
 
 the remaining gap to cublas is warptiling + bank-conflict-free layouts, a bigger
-rewrite. ill keep improving it.
+rewrite. ill keep improving it later on. 
