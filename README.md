@@ -1,7 +1,7 @@
 # sgemm climb
 
 writing matrix multiply (C = A·B) from scratch on an RTX 4080 and making it fast
-by climbing the memory hierarchy — get the data close to the cores and reuse it.
+by climbing the memory hierarchy: get the data close to the cores and reuse it.
 one idea the whole way: speed isn't doing more work, it's not waiting on memory.
 
 build and run:
@@ -21,9 +21,9 @@ results (N=4096, FP32):
 | reg_db       | 29,029 | + double buffering (prefetch next tile while computing)   |
 | cublas       | 35,300 | NVIDIA's hand-tuned reference (the ceiling)               |
 
-the register kernel (~50 lines) hit **24k — 8× naive**. vectorized loads added the
+the register kernel (~50 lines) hit **24k, 8× naive**. vectorized loads added the
 next real jump; double buffering added a sliver on top (the warp scheduler already
 hides most of that latency for free). we land at ~62% of cublas.
 
-the remaining gap to cublas is warptiling + bank-conflict-free layouts — a bigger
+the remaining gap to cublas is warptiling + bank-conflict-free layouts, a bigger
 rewrite. ill keep improving it.
